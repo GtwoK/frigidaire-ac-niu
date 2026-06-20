@@ -1,0 +1,65 @@
+# ESPHome replacement for the Electrolux/Frigidaire NIU-LIGHT Wi-Fi module.
+
+esphome:
+  name: ac-niu
+  friendly_name: Main Floor AC
+
+esp32:
+  variant: esp32c3
+  framework:
+    type: arduino
+
+external_components:
+  - source: github://gtwok/frigidaire-ac-niu@main
+    components: [ac_niu_climate]
+
+uart:
+  id: ac_bus
+  tx_pin: GPIO5
+  rx_pin: GPIO4
+  baud_rate: 9600
+  data_bits: 8
+  parity: EVEN
+  stop_bits: 1
+  rx_buffer_size: 1024
+
+climate:
+  - platform: ac_niu_climate
+    name: Main Floor AC
+    uart_id: ac_bus
+    child_lock:
+      name: "Child Lock"
+      icon: "mdi:account-lock"
+    filter_door:
+      name: "Filter Door"
+    coil_temperature:
+      name: "Coil Temperature"
+    air_quality_raw:
+      name: "Air Quality Raw"
+      icon: "mdi:air-filter"
+    air_quality:
+      name: "Air Quality"
+      icon: "mdi:air-filter"
+    filter_status:
+      name: "Filter Status"
+      icon: "mdi:air-filter"
+
+sensor:
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    update_interval: 10s
+    entity_category: diagnostic
+
+logger:
+  level: INFO
+
+api:
+  reboot_timeout: 0s
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  

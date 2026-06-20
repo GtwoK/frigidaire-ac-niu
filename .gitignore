@@ -1,0 +1,6 @@
+.DS_Store
+.esphome/
+__pycache__/
+*.py[cod]
+secrets.yaml
+
