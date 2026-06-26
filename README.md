@@ -50,7 +50,8 @@ uart:
 
 climate:
   - platform: ac_niu_climate
-    name: "Air Conditioner"
+    # Use the ESPHome friendly name without adding a second entity suffix.
+    name: None
     uart_id: ac_bus
 ```
 
@@ -61,12 +62,12 @@ Optional child entities are added beneath the climate entry. These will add sens
 ```yaml
 climate:
   - platform: ac_niu_climate
-    name: "Air Conditioner"
+    name: None
     uart_id: ac_bus
     child_lock:
       name: "Child Lock"
-    filter_door:
-      name: "Filter Door"
+    pureair_filter_installed:
+      name: "PureAir Filter Installed"
     coil_temperature:
       name: "Coil Temperature"
     air_quality_raw:
@@ -75,6 +76,8 @@ climate:
       name: "Air Quality"
     filter_status:
       name: "Filter Status"
+    sleep_mode:
+      name: "Sleep Mode"
 ```
 
 ## Supported controls
@@ -95,8 +98,14 @@ The reverse-engineered frame format, handshake, register map, and captures are d
 
 Unmapped registers, markers, malformed events, and unexpected values on mapped registers are logged at `INFO` with the complete raw frame.
 
+## Protocol development
+
+The example configuration registers a Home Assistant action named `esphome.ac_niu_set_ac_register` for testing SET registers. Its `command` field contains the two-byte register followed by one or more value bytes, written as hexadecimal. For ex, `04 26 01` enables Eco mode.
+
+This is an advanced development tool: only write registers whose behavior is understood.
+
 ## Known limitations
 
-- The component currently requires the Arduino framework.
 - Child lock, filter, air-quality, and coil-temperature entities are read-only.
 - Dust filter change warning is included, but PureAir filter change warning is not (yet)
+- Schedule set is likely a boolean in the dump somewhere, though unknown where yet (and is moot, anyway)

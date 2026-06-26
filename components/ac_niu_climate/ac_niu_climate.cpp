@@ -1,5 +1,6 @@
 #include "ac_niu_climate.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 
@@ -7,9 +8,33 @@
 #include "esphome/core/helpers.h"
 #include "esphome/core/log.h"
 
+#ifdef USE_API_USER_DEFINED_ACTIONS
+#include "esphome/components/api/user_services.h"
+#include "esphome/core/string_ref.h"
+
+namespace esphome::api {
+
+// ESPHome 2026.6 can omit these API action specializations from the final link.
+// Weak definitions preserve compatibility while deferring to ESPHome when it supplies them.
+template<> __attribute__((weak)) StringRef get_execute_arg_value<StringRef>(const ExecuteServiceArgument &arg) {
+  return arg.string_;
+}
+
+template<> __attribute__((weak)) enums::ServiceArgType to_service_arg_type<StringRef>() {
+  return enums::SERVICE_ARG_TYPE_STRING;
+}
+
+}  // namespace esphome::api
+#endif
+
 namespace esphome::ac_niu {
 
 static const char *const TAG = "ac_niu";
+
+void AcNiuSleepSwitch::write_state(bool state) {
+  if (this->parent_ != nullptr)
+    this->parent_->set_sleep_mode(state);
+}
 
 static const std::vector<std::vector<uint8_t>> INIT_FRAME_TEMPLATES = {
     {0x41, 0x43, 0x31, 0x4E, 0x49, 0x55, 0x02, 0x00, 0x00},
@@ -50,6 +75,16 @@ static uint32_t hash_mac(const uint8_t mac[6], uint32_t domain) {
   return hash;
 }
 
+static int8_t hex_nibble(char c) {
+  if (c >= '0' && c <= '9')
+    return c - '0';
+  if (c >= 'A' && c <= 'F')
+    return c - 'A' + 10;
+  if (c >= 'a' && c <= 'f')
+    return c - 'a' + 10;
+  return -1;
+}
+
 static std::string decimal_identifier(const uint8_t mac[6], uint32_t domain, uint32_t base, uint32_t range,
                                       int width) {
   char value[10];
@@ -74,7 +109,7 @@ void AcNiuClimate::dump_config() {
   ESP_LOGCONFIG(TAG, "  Identity: generated from ESP hardware ID");
   ESP_LOGCONFIG(TAG, "  Optional telemetry:");
   ESP_LOGCONFIG(TAG, "    Child lock: %s", YESNO(this->child_lock_sensor_ != nullptr));
-  ESP_LOGCONFIG(TAG, "    Filter door: %s", YESNO(this->filter_door_sensor_ != nullptr));
+  ESP_LOGCONFIG(TAG, "    PureAir filter installed: %s", YESNO(this->pureair_filter_installed_sensor_ != nullptr));
   ESP_LOGCONFIG(TAG, "    Coil temperature: %s", YESNO(this->coil_temperature_sensor_ != nullptr));
   ESP_LOGCONFIG(TAG, "    Air quality: %s", YESNO(this->air_quality_sensor_ != nullptr));
 }
@@ -101,10 +136,12 @@ climate::ClimateTraits AcNiuClimate::traits() {
 }
 
 void AcNiuClimate::control(const climate::ClimateCall &call) {
-  if (!this->engaged_ || !this->initialized_) {
-    ESP_LOGW(TAG, "Control rejected: bus is not ready");
+  if (!this->engaged_) {
+    this->log_bus_state_("Control rejected: AC has not answered discovery");
     return;
   }
+  if (!this->initialized_)
+    this->log_bus_state_("Control queued while NIU initialization is still running");
 
   climate::ClimateMode effective_mode = this->mode;
   if (call.get_mode().has_value()) {
@@ -175,16 +212,25 @@ void AcNiuClimate::control(const climate::ClimateCall &call) {
 
 void AcNiuClimate::process_tx_(uint32_t now) {
   if (this->engaged_ && now - this->last_rx_ms_ > 3500) {
-    ESP_LOGW(TAG, "AC stopped replying; returning to discovery");
+    this->log_bus_state_("AC stopped replying; returning to discovery");
     this->reset_session_(now);
   }
   if (!this->pending_ack_.empty()) {
     if (static_cast<int32_t>(now - this->ack_due_ms_) < 0)
       return;
+    this->event_ack_seq_ = this->tx_seq_;
     this->send_body_(this->pending_ack_, "event acknowledgement");
     this->pending_ack_.clear();
+    this->waiting_event_ack_reply_ = true;
+    this->event_ack_reply_deadline_ms_ = now + 180;
     this->next_tx_ms_ = now + 40;
     return;
+  }
+  if (this->waiting_event_ack_reply_) {
+    if (static_cast<int32_t>(now - this->event_ack_reply_deadline_ms_) < 0)
+      return;
+    ESP_LOGV(TAG, "No event acknowledgement reply before timeout; resuming poll");
+    this->waiting_event_ack_reply_ = false;
   }
   if (static_cast<int32_t>(now - this->next_tx_ms_) < 0)
     return;
@@ -227,7 +273,7 @@ void AcNiuClimate::process_tx_(uint32_t now) {
       this->next_tx_ms_ = now + 500;
       return;
     }
-    if (now - this->command_sent_ms_ >= 500) {
+    if (now - this->command_sent_ms_ >= 1200) {
       ESP_LOGW(TAG, "SET timeout for register %04X", this->command_reg_);
       this->command_pending_ = false;
       this->command_sent_ = false;
@@ -255,8 +301,11 @@ void AcNiuClimate::process_rx_() {
       return;
     if (this->rx_buf_.empty() && byte != 0xC6)
       continue;
-    if (byte == 0xC6 && !this->rx_buf_.empty())
+    if (byte == 0xC6 && !this->rx_buf_.empty()) {
+      this->rx_resyncs_++;
+      ESP_LOGD(TAG, "RX resync at new frame sentinel after partial_len=%u", static_cast<unsigned>(this->rx_buf_.size()));
       this->rx_buf_.clear();
+    }
     this->rx_buf_.push_back(byte);
     if (this->rx_buf_.size() < 2)
       continue;
@@ -272,11 +321,31 @@ void AcNiuClimate::process_rx_() {
     uint8_t checksum = 0;
     for (size_t i = 1; i + 1 < needed; i++)
       checksum ^= this->rx_buf_[i];
-    if (checksum == this->rx_buf_[needed - 1])
+    if (checksum == this->rx_buf_[needed - 1]) {
+      this->rx_good_frames_++;
       this->handle_frame_(this->rx_buf_);
-    else
-      ESP_LOGW(TAG, "RX checksum failure");
-    this->rx_buf_.clear();
+      this->rx_buf_.clear();
+    } else {
+      if (this->waiting_event_ack_reply_ && this->is_event_ack_reply_(this->rx_buf_)) {
+        this->waiting_event_ack_reply_ = false;
+        this->next_tx_ms_ = millis() + 40;
+        ESP_LOGD(TAG, "Ignoring bad checksum on event acknowledgement reply seq=%02X", this->rx_buf_[3]);
+        this->rx_buf_.clear();
+        continue;
+      }
+      this->rx_bad_frames_++;
+      char raw[128 * 3];
+      format_hex_pretty_to(raw, sizeof(raw), this->rx_buf_.data(), this->rx_buf_.size(), ' ');
+      ESP_LOGW(TAG, "RX checksum failure calculated=%02X received=%02X raw=[%s]", checksum,
+               this->rx_buf_[needed - 1], raw);
+      // A dropped byte can make the start of the next frame complete the damaged frame's
+      // advertised length. Preserve that next sentinel so subsequent bytes can recover it.
+      auto next = std::find(this->rx_buf_.begin() + 1, this->rx_buf_.end(), 0xC6);
+      if (next == this->rx_buf_.end())
+        this->rx_buf_.clear();
+      else
+        this->rx_buf_.erase(this->rx_buf_.begin(), next);
+    }
   }
 }
 
@@ -295,13 +364,18 @@ void AcNiuClimate::handle_frame_(const std::vector<uint8_t> &frame) {
   }
 
   if (this->initialized_ && frame.size() >= 15 && frame[11] == 0x02 && frame[12] == 0x02 &&
-      frame[13] == 0x07)
+      frame[13] == 0x07) {
+    this->waiting_event_ack_reply_ = false;
     this->next_tx_ms_ = now + 40;
+  }
 
   if (this->command_sent_ && frame.size() >= 15 && frame[11] == (this->command_reg_ >> 8) &&
       frame[12] == (this->command_reg_ & 0xFF)) {
-    if (frame[13] != 0x05)
-      ESP_LOGW(TAG, "Unexpected SET response %02X for register %04X", frame[13], this->command_reg_);
+    if (frame[13] != 0x05) {
+      char raw[128 * 3];
+      format_hex_pretty_to(raw, sizeof(raw), frame.data(), frame.size(), ' ');
+      ESP_LOGW(TAG, "Unexpected SET response %02X for register %04X raw=[%s]", frame[13], this->command_reg_, raw);
+    }
     this->command_pending_ = false;
     this->command_sent_ = false;
     this->next_tx_ms_ = now + 40;
@@ -366,6 +440,13 @@ void AcNiuClimate::handle_event_(const std::vector<uint8_t> &frame) {
         this->preset = v != 0 ? climate::CLIMATE_PRESET_ECO : climate::CLIMATE_PRESET_NONE;
         this->publish_state();
         break;
+      case 0x0428:
+        value_valid = v == 0x00 || v == 0x01;
+        if (value_valid) {
+          if (this->sleep_switch_ != nullptr)
+            this->sleep_switch_->publish_state(v == 0x01);
+        }
+        break;
       case 0x1009:
         value_valid = v == 0x00 || v == 0x01;
         this->swing_mode = v != 0 ? climate::CLIMATE_SWING_VERTICAL : climate::CLIMATE_SWING_OFF;
@@ -378,12 +459,13 @@ void AcNiuClimate::handle_event_(const std::vector<uint8_t> &frame) {
         break;
       case 0x0651:
         value_valid = v == 0x00 || v == 0x01;
-        if (this->filter_door_sensor_ != nullptr)
-          this->filter_door_sensor_->publish_state(v == 0);
+        if (this->pureair_filter_installed_sensor_ != nullptr)
+          this->pureair_filter_installed_sensor_->publish_state(v == 0x01);
         break;
       case 0x0622:
+        value_valid = value_len >= 2;
         if (this->air_quality_raw_sensor_ != nullptr)
-          this->air_quality_raw_sensor_->publish_state(v * 100.0f / 255.0f);
+          this->air_quality_raw_sensor_->publish_state(value_valid ? (static_cast<uint16_t>(value[0]) << 8) | value[1] : v);
         break;
       case 0x0621:
         value_valid = v <= 0x02;
@@ -421,9 +503,13 @@ void AcNiuClimate::handle_event_(const std::vector<uint8_t> &frame) {
       this->log_unknown_event_("unmapped register", frame, reg, marker);
     else if (!value_valid)
       this->log_unknown_event_("unexpected value", frame, reg, marker);
-    ESP_LOGD(TAG, "Event register %04X value %02X length %u", reg, v, static_cast<unsigned>(value_len));
+    char raw_value[128 * 3];
+    format_hex_pretty_to(raw_value, sizeof(raw_value), value, value_len, ' ');
+    ESP_LOGD(TAG, "Event register %04X value=[%s] length %u", reg, raw_value, static_cast<unsigned>(value_len));
   } else if (marker == 0x06) {
     this->log_unknown_event_("missing event value", frame, reg, marker);
+  } else if (marker == 0x04 && reg == 0x0024) {
+    ESP_LOGI(TAG, "WiFi setup requested; ignored");
   } else if (marker != 0x04 || reg != 0x0401) {
     this->log_unknown_event_("unrecognized event marker", frame, reg, marker);
   }
@@ -446,6 +532,12 @@ void AcNiuClimate::log_unknown_event_(const char *reason, const std::vector<uint
            reg, marker, raw);
 }
 
+bool AcNiuClimate::is_event_ack_reply_(const std::vector<uint8_t> &frame) const {
+  return frame.size() >= 15 && frame[1] == 0x0C && (frame[2] & 0xF0) == 0x00 && frame[3] == this->event_ack_seq_ &&
+         frame[4] == 0xAD && frame[5] == 0x4E && frame[6] == 0x49 && frame[7] == 0x55 && frame[8] == 0x41 &&
+         frame[9] == 0x43 && frame[10] == 0x31 && frame[11] == 0x02 && frame[12] == 0x02 && frame[13] == 0x07;
+}
+
 void AcNiuClimate::send_body_(const std::vector<uint8_t> &body, const char *tag) {
   std::vector<uint8_t> frame = {0xC6, static_cast<uint8_t>(3 + body.size()), this->tx_type_, this->tx_seq_, 0xAD};
   frame.insert(frame.end(), body.begin(), body.end());
@@ -465,6 +557,52 @@ void AcNiuClimate::queue_set_(uint16_t reg, std::initializer_list<uint8_t> value
 
 void AcNiuClimate::queue_set_(uint16_t reg, const std::vector<uint8_t> &values) {
   this->command_queue_.push_back({reg, values});
+}
+
+void AcNiuClimate::set_sleep_mode(bool enabled) {
+  this->queue_set_(0x0428, {enabled ? static_cast<uint8_t>(0x01) : static_cast<uint8_t>(0x00)});
+  this->next_tx_ms_ = millis();
+}
+
+void AcNiuClimate::send_manual_set_hex(const std::string &command) {
+  std::vector<uint8_t> bytes;
+  bytes.reserve(command.size() / 2);
+  int8_t high = -1;
+  for (char c : command) {
+    const int8_t nibble = hex_nibble(c);
+    if (nibble >= 0) {
+      if (high < 0)
+        high = nibble;
+      else {
+        bytes.push_back(static_cast<uint8_t>((high << 4) | nibble));
+        high = -1;
+      }
+    } else if (c != ' ' && c != ':' && c != '-' && c != ',' && c != '_') {
+      ESP_LOGW(TAG, "Manual SET rejected: invalid character '%c'", c);
+      return;
+    }
+  }
+  if (high >= 0 || bytes.size() < 3 || bytes.size() > 66) {
+    ESP_LOGW(TAG, "Manual SET rejected: expected a 2-byte register and 1-64 value bytes");
+    return;
+  }
+
+  const uint16_t reg = (static_cast<uint16_t>(bytes[0]) << 8) | bytes[1];
+  this->send_manual_set_(reg, std::vector<uint8_t>(bytes.begin() + 2, bytes.end()));
+}
+
+void AcNiuClimate::send_manual_set_(uint16_t reg, const std::vector<uint8_t> &values) {
+  if (!this->engaged_) {
+    this->log_bus_state_("Manual SET rejected: AC has not answered discovery");
+    return;
+  }
+  if (!this->initialized_)
+    this->log_bus_state_("Manual SET queued while NIU initialization is still running");
+  char raw[64 * 3];
+  format_hex_pretty_to(raw, sizeof(raw), values.data(), values.size(), ' ');
+  ESP_LOGI(TAG, "Manual SET queued reg=%04X values=[%s]", reg, raw);
+  this->queue_set_(reg, values);
+  this->next_tx_ms_ = millis();
 }
 
 void AcNiuClimate::build_identity_frames_() {
@@ -489,6 +627,7 @@ void AcNiuClimate::build_identity_frames_() {
 }
 
 void AcNiuClimate::reset_session_(uint32_t now) {
+  this->session_resets_++;
   this->engaged_ = false;
   this->initialized_ = false;
   this->init_step_ = 0;
@@ -497,6 +636,7 @@ void AcNiuClimate::reset_session_(uint32_t now) {
   this->command_sent_ = false;
   this->command_queue_.clear();
   this->pending_ack_.clear();
+  this->waiting_event_ack_reply_ = false;
   this->next_tx_ms_ = now;
 }
 
@@ -516,6 +656,19 @@ bool AcNiuClimate::target_is_available_() const {
 
 void AcNiuClimate::sync_visible_target_temperature_() {
   this->target_temperature = this->target_is_available_() ? this->confirmed_target_temperature_ : NAN;
+}
+
+void AcNiuClimate::log_bus_state_(const char *reason) const {
+  const uint32_t now = millis();
+  const uint32_t rx_age = this->last_rx_ms_ == 0 ? 0 : now - this->last_rx_ms_;
+  ESP_LOGW(TAG,
+           "%s (engaged=%s initialized=%s init_step=%u/%u last_rx_age=%ums queue=%u pending=%s ack=%s ack_reply=%s "
+           "rx_ok=%u rx_bad=%u resync=%u resets=%u)",
+           reason, YESNO(this->engaged_), YESNO(this->initialized_), static_cast<unsigned>(this->init_step_),
+           static_cast<unsigned>(this->init_frames_.size()), rx_age, static_cast<unsigned>(this->command_queue_.size()),
+           YESNO(this->command_pending_), YESNO(!this->pending_ack_.empty()), YESNO(this->waiting_event_ack_reply_),
+           static_cast<unsigned>(this->rx_good_frames_), static_cast<unsigned>(this->rx_bad_frames_),
+           static_cast<unsigned>(this->rx_resyncs_), static_cast<unsigned>(this->session_resets_));
 }
 
 }  // namespace esphome::ac_niu

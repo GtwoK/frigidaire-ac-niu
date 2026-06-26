@@ -5,9 +5,9 @@ esphome:
   friendly_name: Main Floor AC
 
 esp32:
-  variant: esp32c3
+  variant: esp32c6
   framework:
-    type: arduino
+    type: esp-idf
 
 external_components:
   - source: github://gtwok/frigidaire-ac-niu@main
@@ -15,8 +15,8 @@ external_components:
 
 uart:
   id: ac_bus
-  tx_pin: GPIO5
-  rx_pin: GPIO4
+  tx_pin: GPIO17
+  rx_pin: GPIO16
   baud_rate: 9600
   data_bits: 8
   parity: EVEN
@@ -25,13 +25,15 @@ uart:
 
 climate:
   - platform: ac_niu_climate
-    name: Main Floor AC
+    id: ac_climate
+    name: None
     uart_id: ac_bus
     child_lock:
       name: "Child Lock"
       icon: "mdi:account-lock"
-    filter_door:
-      name: "Filter Door"
+    pureair_filter_installed:
+      name: "PureAir Filter Installed"
+      icon: "mdi:air-filter"
     coil_temperature:
       name: "Coil Temperature"
     air_quality_raw:
@@ -43,6 +45,9 @@ climate:
     filter_status:
       name: "Filter Status"
       icon: "mdi:air-filter"
+    sleep_mode:
+      name: "Sleep Mode"
+      icon: "mdi:power-sleep"
 
 sensor:
   - platform: wifi_signal
@@ -55,6 +60,14 @@ logger:
 
 api:
   reboot_timeout: 0s
+  actions:
+    # Advanced reverse-engineering hook. Example: "04 26 01" enables Eco mode.
+    - action: set_ac_register
+      variables:
+        command: string
+      then:
+        - lambda: |-
+            id(ac_climate).send_manual_set_hex(std::string(command));
 
 ota:
   - platform: esphome

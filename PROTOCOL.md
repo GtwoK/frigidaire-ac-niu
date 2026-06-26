@@ -96,14 +96,16 @@ Format note: temperatures use `06 <unit> 00 <value> 00`, where **unit `00`=°C, 
 | `04 35` | Measured temp, probe 2 (coil?) | same format |
 | `04 20` | Temperature display unit | `00`=°C, `01`=°F |
 | `04 26` | Eco mode | `00` off, `01` on |
+| `04 28` | Sleep mode | `00` off, `01` on |
 | `10 09` | Swing | `00` off, `01` on |
 | `04 63` | Child lock | `00` off, `01` on |
-| `06 51` | Dust cover / door | `00` open, `01` closed |
-| `06 22` | Air quality index (raw) | wire value 0–255; ESPHome exposes `raw * 100 / 255` as a percentage |
+| `06 51` | PureAir filter installed | `00` not installed, `01` installed |
+| `06 22` | Air quality index (raw) | two-byte big-endian raw value; units/range unknown |
 | `06 21` | Air quality category | `00` green, `01` yellow, `02` red (with hysteresis) |
 | `04 7C` | Filter status | `03` needs cleaning -> `00` after reset |
 | `10 21` | Filter-related | `03` -> `00` on filter reset |
 | `06 40` | Filter runtime counter | cleared to ~`0` on filter reset |
+| `00 24` | Wi-Fi setup request | nested marker `04`, value `01`; locally acknowledged and otherwise ignored |
 
 ### Tentative
 
@@ -112,7 +114,18 @@ Format note: temperatures use `06 <unit> 00 <value> 00`, where **unit `00`=°C, 
 | `04 A1` | `01` in Dry mode, `00` otherwise — likely a dehumidify flag |
 | `10 30`, `04 B5` | multi-byte monotonic counters (runtime/usage); units unknown |
 | `10 31`, `10 32`, `06 41` | counters seen at `0` |
-| `00 2E`,`00 28`,`04 28`,`04 70`,`04 7E`,`00 EA`,`04 29`,`10 04`,`10 73`,`06 80`,`01 2A`,`00 60`,`00 13` | appear in the state dump; unknown right now |
+| `00 2E`,`00 28`,`04 70`,`04 7E`,`00 EA`,`04 29`,`10 04`,`10 73`,`06 80`,`01 2A`,`00 60`,`00 13` | appear in the state dump; unknown right now |
+
+### Unconfirmed mapping candidates
+
+Potential mappings based on location; not confirmed yet for implementation
+
+| Possible function | Candidate registers | Reason for suspicion |
+|---|---|---|
+| PureAir/HEPA filter needs replacement | `04 70` (strongest), possibly a state derived from `06 41` | `04 70` is a one-byte value reported beside confirmed filter registers `04 7C` and `10 21`; four-byte `06 41` follows confirmed filter runtime `06 40` and may be a second filter lifetime counter |
+| Schedule set/session | `10 73` or `00 EA`; `10 04` remains a conflicting weaker candidate | these are one-byte state-dump values; `10 73` was `00` in an apparently unscheduled capture, while the app capability model contains separate `schedulerSet` and `schedulerSession` booleans |
+
+The app's AC data model also contains separate `filterState`, `hepaFilterState`, `hepaFilterLifeTime`, and `hepaFilterInsertedState` properties, which supports the expectation that the currently unknown dump includes multiple PureAir-related registers.
 
 ### Identity (read during handshake)
 
