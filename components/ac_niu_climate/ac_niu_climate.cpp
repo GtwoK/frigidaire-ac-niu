@@ -30,6 +30,7 @@ template<> __attribute__((weak)) enums::ServiceArgType to_service_arg_type<Strin
 namespace esphome::ac_niu {
 
 static const char *const TAG = "ac_niu";
+static constexpr uint32_t REPLY_WINDOW_MS = 250;
 
 void AcNiuSleepSwitch::write_state(bool state) {
   if (this->parent_ != nullptr)
@@ -200,20 +201,27 @@ void AcNiuClimate::control(const climate::ClimateCall &call) {
     }
   }
 
-  if (call.get_preset().has_value()) {
+  if (call.get_preset().has_value() && !off && !fan_only) {
     if (*call.get_preset() == climate::CLIMATE_PRESET_ECO)
       this->queue_set_(0x0426, {0x01});
     else if (*call.get_preset() == climate::CLIMATE_PRESET_NONE)
       this->queue_set_(0x0426, {0x00});
+  } else if (call.get_preset().has_value()) {
+    this->publish_state();
   }
-
-  this->next_tx_ms_ = millis();
 }
 
 void AcNiuClimate::process_tx_(uint32_t now) {
   if (this->engaged_ && now - this->last_rx_ms_ > 3500) {
     this->log_bus_state_("AC stopped replying; returning to discovery");
     this->reset_session_(now);
+  }
+  if (this->waiting_tx_reply_) {
+    if (static_cast<int32_t>(now - this->tx_reply_deadline_ms_) < 0)
+      return;
+    ESP_LOGV(TAG, "No %s reply before pacing timeout; continuing",
+             this->tx_reply_tag_ != nullptr ? this->tx_reply_tag_ : "frame");
+    this->waiting_tx_reply_ = false;
   }
   if (!this->pending_ack_.empty()) {
     if (static_cast<int32_t>(now - this->ack_due_ms_) < 0)
@@ -301,11 +309,6 @@ void AcNiuClimate::process_rx_() {
       return;
     if (this->rx_buf_.empty() && byte != 0xC6)
       continue;
-    if (byte == 0xC6 && !this->rx_buf_.empty()) {
-      this->rx_resyncs_++;
-      ESP_LOGD(TAG, "RX resync at new frame sentinel after partial_len=%u", static_cast<unsigned>(this->rx_buf_.size()));
-      this->rx_buf_.clear();
-    }
     this->rx_buf_.push_back(byte);
     if (this->rx_buf_.size() < 2)
       continue;
@@ -350,8 +353,14 @@ void AcNiuClimate::process_rx_() {
 }
 
 void AcNiuClimate::handle_frame_(const std::vector<uint8_t> &frame) {
+  if (this->is_tx_echo_(frame)) {
+    ESP_LOGV(TAG, "Ignoring local TX echo type=%02X seq=%02X", frame[2], frame[3]);
+    return;
+  }
+
   const uint32_t now = millis();
   this->last_rx_ms_ = now;
+  this->clear_tx_reply_wait_(frame);
   if (!this->engaged_) {
     this->engaged_ = true;
     this->initialized_ = false;
@@ -532,10 +541,20 @@ void AcNiuClimate::log_unknown_event_(const char *reason, const std::vector<uint
            reg, marker, raw);
 }
 
+bool AcNiuClimate::is_tx_echo_(const std::vector<uint8_t> &frame) const {
+  return frame.size() >= 11 && frame[4] == 0xAD && frame[5] == 0x41 && frame[6] == 0x43 && frame[7] == 0x31 &&
+         frame[8] == 0x4E && frame[9] == 0x49 && frame[10] == 0x55;
+}
+
 bool AcNiuClimate::is_event_ack_reply_(const std::vector<uint8_t> &frame) const {
   return frame.size() >= 15 && frame[1] == 0x0C && (frame[2] & 0xF0) == 0x00 && frame[3] == this->event_ack_seq_ &&
          frame[4] == 0xAD && frame[5] == 0x4E && frame[6] == 0x49 && frame[7] == 0x55 && frame[8] == 0x41 &&
          frame[9] == 0x43 && frame[10] == 0x31 && frame[11] == 0x02 && frame[12] == 0x02 && frame[13] == 0x07;
+}
+
+void AcNiuClimate::clear_tx_reply_wait_(const std::vector<uint8_t> &frame) {
+  if (this->waiting_tx_reply_ && frame.size() >= 4 && frame[3] == this->tx_reply_seq_)
+    this->waiting_tx_reply_ = false;
 }
 
 void AcNiuClimate::send_body_(const std::vector<uint8_t> &body, const char *tag) {
@@ -547,6 +566,10 @@ void AcNiuClimate::send_body_(const std::vector<uint8_t> &body, const char *tag)
   frame.push_back(checksum);
   this->write_array(frame.data(), frame.size());
   ESP_LOGD(TAG, "TX %s type=%02X seq=%02X", tag, this->tx_type_, this->tx_seq_);
+  this->waiting_tx_reply_ = true;
+  this->tx_reply_seq_ = this->tx_seq_;
+  this->tx_reply_deadline_ms_ = millis() + REPLY_WINDOW_MS;
+  this->tx_reply_tag_ = tag;
   if (++this->tx_seq_ == 0)
     this->tx_type_ = 0x80 | ((this->tx_type_ + 1) & 0x0F);
 }
@@ -561,7 +584,6 @@ void AcNiuClimate::queue_set_(uint16_t reg, const std::vector<uint8_t> &values) 
 
 void AcNiuClimate::set_sleep_mode(bool enabled) {
   this->queue_set_(0x0428, {enabled ? static_cast<uint8_t>(0x01) : static_cast<uint8_t>(0x00)});
-  this->next_tx_ms_ = millis();
 }
 
 void AcNiuClimate::send_manual_set_hex(const std::string &command) {
@@ -602,7 +624,6 @@ void AcNiuClimate::send_manual_set_(uint16_t reg, const std::vector<uint8_t> &va
   format_hex_pretty_to(raw, sizeof(raw), values.data(), values.size(), ' ');
   ESP_LOGI(TAG, "Manual SET queued reg=%04X values=[%s]", reg, raw);
   this->queue_set_(reg, values);
-  this->next_tx_ms_ = millis();
 }
 
 void AcNiuClimate::build_identity_frames_() {
@@ -636,6 +657,7 @@ void AcNiuClimate::reset_session_(uint32_t now) {
   this->command_sent_ = false;
   this->command_queue_.clear();
   this->pending_ack_.clear();
+  this->waiting_tx_reply_ = false;
   this->waiting_event_ack_reply_ = false;
   this->next_tx_ms_ = now;
 }
@@ -662,11 +684,13 @@ void AcNiuClimate::log_bus_state_(const char *reason) const {
   const uint32_t now = millis();
   const uint32_t rx_age = this->last_rx_ms_ == 0 ? 0 : now - this->last_rx_ms_;
   ESP_LOGW(TAG,
-           "%s (engaged=%s initialized=%s init_step=%u/%u last_rx_age=%ums queue=%u pending=%s ack=%s ack_reply=%s "
+           "%s (engaged=%s initialized=%s init_step=%u/%u last_rx_age=%ums queue=%u pending=%s ack=%s "
+           "tx_reply=%s ack_reply=%s "
            "rx_ok=%u rx_bad=%u resync=%u resets=%u)",
            reason, YESNO(this->engaged_), YESNO(this->initialized_), static_cast<unsigned>(this->init_step_),
            static_cast<unsigned>(this->init_frames_.size()), rx_age, static_cast<unsigned>(this->command_queue_.size()),
-           YESNO(this->command_pending_), YESNO(!this->pending_ack_.empty()), YESNO(this->waiting_event_ack_reply_),
+           YESNO(this->command_pending_), YESNO(!this->pending_ack_.empty()), YESNO(this->waiting_tx_reply_),
+           YESNO(this->waiting_event_ack_reply_),
            static_cast<unsigned>(this->rx_good_frames_), static_cast<unsigned>(this->rx_bad_frames_),
            static_cast<unsigned>(this->rx_resyncs_), static_cast<unsigned>(this->session_resets_));
 }

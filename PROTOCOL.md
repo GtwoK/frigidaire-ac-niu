@@ -43,6 +43,8 @@ C6  LEN  TYPE  SEQ  AD  ADDR1[3]  ADDR2[3]  PAYLOAD[..]  CHK
 
 The NIU polls ~1 Hz. The AC answers in its slot — `02 01 01` if nothing changed, or a `<reg> 06 <value>` report if something did. The NIU acks with `<reg> 07`; the AC closes with `02 02 07`. State values are **event-driven**: they are sent once at connect (full dump) and again only when they change.
 
+Commands keep the master's cadence, queuing to replace the next poll slot. Sending a command immediately after a poll can collide with the AC's transaction cadence and produce checksum failures/timeouts.
+
 ### Confirmed control transaction
 
 Operational control is a direct register SET, not a nested event frame:

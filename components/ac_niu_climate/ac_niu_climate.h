@@ -61,7 +61,9 @@ class AcNiuClimate : public climate::Climate, public Component, public uart::UAR
   void handle_frame_(const std::vector<uint8_t> &frame);
   void handle_event_(const std::vector<uint8_t> &frame);
   void log_unknown_event_(const char *reason, const std::vector<uint8_t> &frame, uint16_t reg, uint8_t marker);
+  bool is_tx_echo_(const std::vector<uint8_t> &frame) const;
   bool is_event_ack_reply_(const std::vector<uint8_t> &frame) const;
+  void clear_tx_reply_wait_(const std::vector<uint8_t> &frame);
   void send_body_(const std::vector<uint8_t> &body, const char *tag);
   void queue_set_(uint16_t reg, std::initializer_list<uint8_t> values);
   void queue_set_(uint16_t reg, const std::vector<uint8_t> &values);
@@ -83,6 +85,10 @@ class AcNiuClimate : public climate::Climate, public Component, public uart::UAR
   bool initialized_{false};
   uint32_t last_rx_ms_{0};
   uint32_t next_tx_ms_{0};
+  bool waiting_tx_reply_{false};
+  uint8_t tx_reply_seq_{0};
+  uint32_t tx_reply_deadline_ms_{0};
+  const char *tx_reply_tag_{nullptr};
   uint8_t poll_count_{0};
   size_t init_step_{0};
   bool ac_powered_{false};
